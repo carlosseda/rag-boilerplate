@@ -5,6 +5,8 @@ const OCRService = require('./services//ocr-service')
 const OpenAIService = require('./services/openai-service')
 const VectorService = require('./services/vector-service')
 const PDFService = require('./services/pdf-service')
+const { segmentationSchema } = require('./ia/schemas')
+const { segmentationInstructions } = require('./ia/instructions')
 
 async function main() {
 
@@ -35,48 +37,43 @@ async function main() {
 
     for await (const filePath of extractFilesFromFolder(folderPath)) {
       const relativePath = path.relative(folderPath, filePath)
-      const ocrOutputPath = path.join(__dirname, 'output', 'ocr', `${relativePath}.txt`)
-      const result = await processFile(filePath, { ocrService, pdfService, openAIService, vastInstanceUrl, ocrOutputPath })
+      const outputFile = path.join(__dirname, 'output', 'keywords', `${relativePath}.json`)
+      const result = await processFile(filePath, { ocrService, pdfService, openAIService, vastInstanceUrl, outputFile })
 
       if (result) {
         results.push({ reference: relativePath.split(path.sep).join('/'), ...result })
       }
     }
 
-    const outputDir = path.join(__dirname, 'output', 'keywords')
-    const jsonFile = path.join(outputDir, 'keywords.json')
-    await fs.mkdir(outputDir, { recursive: true })
-    await fs.writeFile(jsonFile, JSON.stringify(results, null, 2), 'utf8')
+    // if (results.length === 0) return
 
-    if (results.length === 0) return
+    // const data = results.reduce((acc, element) => {
+    //   acc.ids.push(element.reference)
+    //   acc.documents.push(element.keywords)
+    //   acc.metadatas.push({
+    //     "filepath": element.filepath,
+    //     "filename": element.filename,
+    //     "filetype": element.filetype,
+    //     "text": element.text
+    //   })
 
-    const data = results.reduce((acc, element) => {
-      acc.ids.push(element.reference)
-      acc.documents.push(element.keywords)
-      acc.metadatas.push({
-        "filepath": element.filepath,
-        "filename": element.filename,
-        "filetype": element.filetype,
-        "text": element.text
-      })
+    //   return acc
+    // }, {
+    //   ids: [],
+    //   documents: [],
+    //   metadatas: []
+    // })
 
-      return acc
-    }, {
-      ids: [],
-      documents: [],
-      metadatas: []
-    })
-
-    const vectorService = new VectorService({
-      clientOptions: {
-        host: process.env.CHROMA_HOST || '127.0.0.1',
-        port: Number(process.env.CHROMA_PORT || 8000),
-        ssl: process.env.CHROMA_SSL === 'true',
-        database: 'boib'
-      }
-    })
-    await vectorService.getCollection('publications')
-    await vectorService.addDocuments(data)
+    // const vectorService = new VectorService({
+    //   clientOptions: {
+    //     host: process.env.CHROMA_HOST || '127.0.0.1',
+    //     port: Number(process.env.CHROMA_PORT || 8000),
+    //     ssl: process.env.CHROMA_SSL === 'true',
+    //     database: 'boib'
+    //   }
+    // })
+    // await vectorService.getCollection('publications')
+    // await vectorService.addDocuments(data)
 
   } catch (error) {
     console.error('Error:', error.message)
@@ -97,7 +94,7 @@ async function* extractFilesFromFolder(folderPath) {
   }
 }
 
-async function processFile(filePath, { ocrService, pdfService, openAIService, vastInstanceUrl, ocrOutputPath }) {
+async function processFile(filePath, { ocrService, pdfService, openAIService, vastInstanceUrl, outputFile }) {
   const { valid, extension, mimetype } = await ocrService.validFileExtension(filePath)
 
   if (!valid) return
@@ -129,44 +126,183 @@ async function processFile(filePath, { ocrService, pdfService, openAIService, va
         parts.push(await ocrService.executeOCR(vastInstanceUrl, partPath))
       }
 
-      text = parts.join('\n\n')
+      const rawtText = parts.join('\n\n')
+      const units = ocrService.parseSourceUnits(rawtText)
+
+      if (!units.length) {
+        throw new Error('No OCR content was found.')
+      }
+
+      const batches = ocrService.buildBatches({ units, maxBatchCharacters: 40000 });
+
+      const indexById = new Map(
+        units.map((unit, index) => [
+          unit.id,
+          index
+        ])
+      )
+
+      const finalSegments = []
+      const documentOrientation = ocrService.buildDocumentOrientation(units);
+
+      for (let batchIndex = 0; batchIndex < batches.length; batchIndex++) {
+
+        const batch = batches[batchIndex];
+        const ownedUnits = units.slice(batch.startIndex, batch.endIndex)
+        const previousSegment = finalSegments.at(-1)
+        const previousExcerpt = previousSegment ? previousSegment.text.slice(-3500) : ''
+
+        const input = [
+          'DOCUMENT ORIENTATION:',
+          documentOrientation,
+
+          '\nPREVIOUS FINAL SEGMENT:',
+          previousSegment
+            ? JSON.stringify({
+                title: previousSegment.title,
+                keywords: previousSegment.keywords,
+                last_source_id: previousSegment.end_id,
+                text_end: previousExcerpt
+              })
+            : '(none)',
+
+          '\nCONTEXT BEFORE TARGET:',
+          ocrService.getContext({ units, startIndex: batch.startIndex, endIndex: batch.endIndex, direction: 'before', contextCharacters: 3000 }) || '(none)',
+
+          '\nTARGET UNITS — ALL MUST BE COVERED EXACTLY ONCE:',
+          ownedUnits.map(unit => ocrService.printUnit(unit)).join('\n\n'),
+
+          '\nCONTEXT AFTER TARGET:',
+          ocrService.getContext({ units, startIndex: batch.startIndex, endIndex: batch.endIndex, direction: 'after', contextCharacters: 3000 }) || '(none)'
+
+        ].join('\n')
+
+        let data
+
+        for (let attempt = 1; attempt <= 3; attempt ++) {
+
+          try {
+            const response = await openAIService.createResponse({
+              input,
+              model: 'gpt-6-luna',
+              options: {
+                reasoning: {
+                  effort: 'low'
+                },
+                max_output_tokens: 16000,
+                store: false,
+                instructions: segmentationInstructions,
+                prompt_cache_key: 'ocr-semantic-segmentation-v1',
+                text: {
+                  format: {
+                    type: 'json_schema',
+                    name: 'semantic_document_fragments',
+                    strict: true,
+                    schema: segmentationSchema
+                  }
+                }
+              }
+            })
+
+            data = JSON.parse(response.output_text)
+
+            ocrService.validateCoverage(data.segments, batch, units, indexById)
+
+            if (data.join_previous && (!previousSegment || !data.segments.length)) {
+              throw new Error('Invalid join_previous without an existing segment.')
+            }
+
+            break
+
+          } catch (error) {
+            if (attempt === 3) {
+              throw error
+            }
+
+            console.warn(`Batch ${batchIndex + 1}: retrying after ${error.message}`)
+          }
+        }
+
+        const newSegments = data.segments.map(
+          (segment) => ocrService.makeSegment(segment, units, indexById)
+        )
+
+        if (data.join_previous) {
+          const firstSegment = newSegments.shift()
+          const previous = finalSegments[finalSegments.length - 1]
+          const joinedStart = indexById.get(previous.start_id)
+          const joinedEnd = indexById.get(firstSegment.end_id)
+          const joinedUnits = units.slice(joinedStart, joinedEnd + 1)
+
+          previous.end_id = firstSegment.end_id
+          previous.title = data.joined_title || previous.title;
+          previous.keywords = data.joined_keywords;
+          previous.pages = [
+            ...new Set(
+              joinedUnits
+                .map((unit) => unit.page)
+                .filter((page) => page != null)
+            )
+          ];
+
+          previous.source_block_ids = [
+            ...new Set(
+              joinedUnits.map(
+                (unit) => unit.source_block_id
+              )
+            )
+          ];
+
+          previous.text = ocrService.assembleText(units, joinedStart, joinedEnd)
+        }
+
+        finalSegments.push(...newSegments)
+      }
+
+      for (let index = 0; index < finalSegments.length; index ++) {
+        finalSegments[index].id = `S${String(index + 1).padStart(6, '0')}`;
+      }
+
+      await fs.mkdir(path.dirname(outputFile), { recursive: true })
+      await fs.writeFile(
+        outputFile,
+        `${JSON.stringify(finalSegments, null, 2)}\n`,
+        'utf8'
+      )
+
+      return finalSegments
       
     } finally {
       await fs.rm(tmpDir, { recursive: true, force: true })
     }
+
   } else {
+
     text = await ocrService.executeOCR(vastInstanceUrl, filePath)
-  }
 
-  await fs.mkdir(path.dirname(ocrOutputPath), { recursive: true })
-  await fs.writeFile(ocrOutputPath, text ?? '', 'utf8')
+    if (extension !== '.pdf' && !text?.trim()) {
+      const buffer = await fs.readFile(filePath)
+      const response = await openAIService.analyzeImageBuffer([{ buffer, mimetype }], 'gpt-6.1-terra')
+      text = response.output_text
+    }
 
-  // if (extension !== '.pdf' && !text?.trim()) {
-  //   const buffer = await fs.readFile(filePath)
-  //   const response = await openAIService.analyzeImageBuffer([{ buffer, mimetype }], 'gpt-6.1-terra')
-  //   text = response.output_text
-  // }
+    const { output_text: keywords } = await openAIService.createResponse({
+      input: `Extrae las palabras clave del siguiente texto y devuélvelas separadas por comas.\n\n${text}`,
+      model: 'gpt-6-luna'
+    })
 
-  // const { output_text: keywords } = await openAIService.createResponse({
-  //   input: `Extrae las palabras clave del siguiente texto y devuélvelas separadas por comas.\n\n${text}`,
-  //   model: 'gpt-6-luna'
-  // })
+    const embedding = await openAIService.generateEmbedding({ text: keywords })
 
-  // const embedding = await openAIService.generateEmbedding({ text: keywords })
-
-  // return {
-  //   filepath: filePath,
-  //   filename: path.basename(filePath),
-  //   filetype: extension,
-  //   text,
-  //   keywords,
-  //   modelo: 'text-embedding-3-large',
-  //   dimensiones: embedding.length,
-  //   embedding
-  // }
-
-  return {
-    text
+    return {
+      filepath: filePath,
+      filename: path.basename(filePath),
+      filetype: extension,
+      text,
+      keywords,
+      modelo: 'text-embedding-3-large',
+      dimensiones: embedding.length,
+      embedding
+    }
   }
 }
 
