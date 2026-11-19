@@ -45,35 +45,35 @@ async function main() {
       }
     }
 
-    // if (results.length === 0) return
+    if (results.length === 0) return
 
-    // const data = results.reduce((acc, element) => {
-    //   acc.ids.push(element.reference)
-    //   acc.documents.push(element.keywords)
-    //   acc.metadatas.push({
-    //     "filepath": element.filepath,
-    //     "filename": element.filename,
-    //     "filetype": element.filetype,
-    //     "text": element.text
-    //   })
+    const data = results.reduce((acc, element) => {
+      acc.ids.push(element.reference)
+      acc.documents.push(element.keywords)
+      acc.metadatas.push({
+        "filepath": element.filepath,
+        "filename": element.filename,
+        "filetype": element.filetype,
+        "text": element.text
+      })
 
-    //   return acc
-    // }, {
-    //   ids: [],
-    //   documents: [],
-    //   metadatas: []
-    // })
+      return acc
+    }, {
+      ids: [],
+      documents: [],
+      metadatas: []
+    })
 
-    // const vectorService = new VectorService({
-    //   clientOptions: {
-    //     host: process.env.CHROMA_HOST || '127.0.0.1',
-    //     port: Number(process.env.CHROMA_PORT || 8000),
-    //     ssl: process.env.CHROMA_SSL === 'true',
-    //     database: 'boib'
-    //   }
-    // })
-    // await vectorService.getCollection('publications')
-    // await vectorService.addDocuments(data)
+    const vectorService = new VectorService({
+      clientOptions: {
+        host: process.env.CHROMA_HOST || '127.0.0.1',
+        port: Number(process.env.CHROMA_PORT || 8000),
+        ssl: process.env.CHROMA_SSL === 'true',
+        database: 'boib'
+      }
+    })
+    await vectorService.getCollection('publications')
+    await vectorService.addDocuments(data)
 
   } catch (error) {
     console.error('Error:', error.message)
@@ -121,11 +121,14 @@ async function processFile(filePath, { ocrService, pdfService, openAIService, va
 
       const parts = []
 
+      console.time('ocr')
       for (const filename of files) {
         const partPath = path.join(tmpDir, filename)
         parts.push(await ocrService.executeOCR(vastInstanceUrl, partPath))
       }
+      console.timeEnd('ocr')
 
+      console.time('processBatch')
       const rawtText = parts.join('\n\n')
       const units = ocrService.parseSourceUnits(rawtText)
 
@@ -144,7 +147,9 @@ async function processFile(filePath, { ocrService, pdfService, openAIService, va
 
       const finalSegments = []
       const documentOrientation = ocrService.buildDocumentOrientation(units);
+      console.timeEnd('processBatch')
 
+      console.time('openAI')
       for (let batchIndex = 0; batchIndex < batches.length; batchIndex++) {
 
         const batch = batches[batchIndex];
@@ -182,6 +187,8 @@ async function processFile(filePath, { ocrService, pdfService, openAIService, va
         for (let attempt = 1; attempt <= 3; attempt ++) {
 
           try {
+            openAIService.resetConversation()
+
             const response = await openAIService.createResponse({
               input,
               model: 'gpt-6-luna',
@@ -206,11 +213,11 @@ async function processFile(filePath, { ocrService, pdfService, openAIService, va
 
             data = JSON.parse(response.output_text)
 
-            ocrService.validateCoverage(data.segments, batch, units, indexById)
+            // ocrService.validateCoverage(data.segments, batch, units, indexById)
 
-            if (data.join_previous && (!previousSegment || !data.segments.length)) {
-              throw new Error('Invalid join_previous without an existing segment.')
-            }
+            // if (data.join_previous && (!previousSegment || !data.segments.length)) {
+            //   throw new Error('Invalid join_previous without an existing segment.')
+            // }
 
             break
 
@@ -258,6 +265,7 @@ async function processFile(filePath, { ocrService, pdfService, openAIService, va
 
         finalSegments.push(...newSegments)
       }
+      console.timeEnd('openAI')
 
       for (let index = 0; index < finalSegments.length; index ++) {
         finalSegments[index].id = `S${String(index + 1).padStart(6, '0')}`;
