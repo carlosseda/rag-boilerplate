@@ -1,36 +1,18 @@
-const fs = require('fs/promises');
-const path = require('path');
-const VastAIService = require('./services/vastai-service')
-const OCRService = require('./services//ocr-service')
+const fs = require('fs/promises')
+const path = require('path')
+const OCRService = require('./services/ocr-service')
 const OpenAIService = require('./services/openai-service')
 const VectorService = require('./services/vector-service')
 const PDFService = require('./services/pdf-service')
-const { segmentationSchema } = require('./ia/schemas')
-const { segmentationInstructions } = require('./ia/instructions')
+const { segmentationSchema, pdfReadingSchema  } = require('./ia/schemas')
+const { segmentationInstructions, pdfReadingInstructions } = require('./ia/instructions')
 
 async function main() {
 
   try {
-    if (!process.env.VAST_API_KEY || !process.env.OCR_API_KEY) {
-      throw new Error('Faltan credenciales o ruta del documento')
-    }
-
     const ocrService = new OCRService()
     const openAIService = new OpenAIService()
     const pdfService = new PDFService()
-    const vastAIService = new VastAIService()
-
-    const vastInstanceUrl = await vastAIService.getMachine(process.env.VAST_INSTANCE_ID)
-
-    while(true){
-      let state = await vastAIService.checkModel(vastInstanceUrl, process.env.OCR_API_KEY)
-
-      if(state){
-        break
-      }
-
-      await new Promise(resolve => setTimeout(resolve, 10_000))
-    }
 
     const folderPath = path.join(__dirname, 'input')
     const results = []
@@ -38,23 +20,39 @@ async function main() {
     for await (const filePath of extractFilesFromFolder(folderPath)) {
       const relativePath = path.relative(folderPath, filePath)
       const outputFile = path.join(__dirname, 'output', 'keywords', `${relativePath}.json`)
-      const result = await processFile(filePath, { ocrService, pdfService, openAIService, vastInstanceUrl, outputFile })
+      const result = await processFile(filePath, { ocrService, pdfService, openAIService, outputFile })
 
-      if (result) {
-        results.push({ reference: relativePath.split(path.sep).join('/'), ...result })
-      }
+      if (!result) continue
+
+      const elements = Array.isArray(result) ? result : [result]
+
+      results.push(...elements.map(element => ({
+        ...element,
+        reference: relativePath.split(path.sep).join('/'),
+        filepath: filePath,
+        filename: path.basename(filePath),
+        filetype: path.extname(filePath).toLowerCase()
+      })))
     }
 
     if (results.length === 0) return
 
     const data = results.reduce((acc, element) => {
-      acc.ids.push(element.reference)
-      acc.documents.push(element.keywords)
+      const keywords = Array.isArray(element.keywords)
+        ? element.keywords.join(',')
+        : String(element.keywords ?? '')
+
+      if (!keywords.trim()) return acc
+
+      acc.ids.push(`${element.reference}#${element.id ?? 'document'}`)
+      acc.documents.push(keywords)
+
       acc.metadatas.push({
-        "filepath": element.filepath,
-        "filename": element.filename,
-        "filetype": element.filetype,
-        "text": element.text
+        filepath: element.filepath,
+        filename: element.filename,
+        filetype: element.filetype,
+        page: element.pages?.[0] ?? 1,
+        text: element.text ?? ''
       })
 
       return acc
@@ -64,15 +62,16 @@ async function main() {
       metadatas: []
     })
 
+    if (data.ids.length === 0) return
+
     const vectorService = new VectorService({
       clientOptions: {
         host: process.env.CHROMA_HOST || '127.0.0.1',
         port: Number(process.env.CHROMA_PORT || 8000),
-        ssl: process.env.CHROMA_SSL === 'true',
-        database: 'boib'
+        ssl: process.env.CHROMA_SSL === 'true'
       }
     })
-    await vectorService.getCollection('publications')
+    await vectorService.getCollection('publications-openai')
     await vectorService.addDocuments(data)
 
   } catch (error) {
@@ -94,7 +93,7 @@ async function* extractFilesFromFolder(folderPath) {
   }
 }
 
-async function processFile(filePath, { ocrService, pdfService, openAIService, vastInstanceUrl, outputFile }) {
+async function processFile(filePath, { ocrService, pdfService, openAIService, outputFile }) {
   const { valid, extension, mimetype } = await ocrService.validFileExtension(filePath)
 
   if (!valid) return
@@ -108,7 +107,7 @@ async function processFile(filePath, { ocrService, pdfService, openAIService, va
 
     try {
       const pdfPages = await pdfService.getPageCount(filePath)
-      const pagesPerFile = 12
+      const pagesPerFile = 3
 
       if (pdfPages > pagesPerFile) {
         await pdfService.splitPDF({ filePath, pagesPerFile, outputDir: tmpDir })
@@ -119,36 +118,72 @@ async function processFile(filePath, { ocrService, pdfService, openAIService, va
       const files = await fs.readdir(tmpDir)
       files.sort((first, second) => first.localeCompare(second, 'en', { numeric: true }))
 
-      const parts = []
-
       console.time('ocr')
-      for (const filename of files) {
-        const partPath = path.join(tmpDir, filename)
-        parts.push(await ocrService.executeOCR(vastInstanceUrl, partPath))
-      }
-      console.timeEnd('ocr')
 
-      console.time('processBatch')
-      const rawtText = parts.join('\n\n')
-      const units = ocrService.parseSourceUnits(rawtText)
+      const concurrency = 10
+      const blocksByPart = []
+
+      for (let start = 0; start < files.length; start += concurrency) {
+        const group = files.slice(start, start + concurrency)
+
+        const results = await Promise.allSettled(
+          group.map((filename, index) => {
+            const partIndex = start + index
+            const pageOffset = partIndex * pagesPerFile
+
+            return readPdfPart({
+              filePath: path.join(tmpDir, filename),
+              pageOffset,
+              pageCount: Math.min(
+                pagesPerFile,
+                pdfPages - pageOffset
+              ),
+              openAIService: new OpenAIService()
+            })
+          })
+        )
+
+        const failed = results.find(result => result.status === 'rejected')
+
+        if (failed) {
+          throw failed.reason
+        }
+
+        blocksByPart.push(...results.map(result => result.value))
+      }
+
+      const units = blocksByPart.flat().map((block, index) => ({
+        ...block,
+        id: `U${String(index + 1).padStart(7, '0')}`,
+        source_block_id: `B${index + 1}`
+      }))
+
+      console.timeEnd('ocr')
 
       if (!units.length) {
         throw new Error('No OCR content was found.')
       }
 
-      const batches = ocrService.buildBatches({ units, maxBatchCharacters: 40000 });
+      const relativePath = path.relative(path.join(__dirname, 'input'), filePath)
+      const ocrOutputPath = path.join(__dirname,'output','ocr',`${relativePath}.txt`)
+      await fs.mkdir(path.dirname(ocrOutputPath), { recursive: true })
+
+      await fs.writeFile(ocrOutputPath,
+        units.map(unit =>
+          `[${unit.id} | página ${unit.page}]\n${unit.text}`
+        ).join('\n\n'),
+        'utf8'
+      )
+
+      const batches = ocrService.buildBatches({units,maxBatchCharacters: 40000})
 
       const indexById = new Map(
-        units.map((unit, index) => [
-          unit.id,
-          index
-        ])
+        units.map((unit, index) => [unit.id, index])
       )
 
       const finalSegments = []
-      const documentOrientation = ocrService.buildDocumentOrientation(units);
-      console.timeEnd('processBatch')
-
+      const documentOrientation = ocrService.buildDocumentOrientation(units)
+                
       console.time('openAI')
       for (let batchIndex = 0; batchIndex < batches.length; batchIndex++) {
 
@@ -212,12 +247,6 @@ async function processFile(filePath, { ocrService, pdfService, openAIService, va
             })
 
             data = JSON.parse(response.output_text)
-
-            // ocrService.validateCoverage(data.segments, batch, units, indexById)
-
-            // if (data.join_previous && (!previousSegment || !data.segments.length)) {
-            //   throw new Error('Invalid join_previous without an existing segment.')
-            // }
 
             break
 
@@ -311,6 +340,68 @@ async function processFile(filePath, { ocrService, pdfService, openAIService, va
       dimensiones: embedding.length,
       embedding
     }
+  }
+
+  async function readPdfPart({filePath, pageOffset, pageCount, openAIService}) {
+
+    const buffer = await fs.readFile(filePath)
+    openAIService.resetConversation()
+
+    const response = await openAIService.createResponse({
+      model: 'gpt-6-luna',
+
+      input: [{
+        role: 'user',
+        content: [
+          {
+            type: 'input_file',
+            filename: path.basename(filePath),
+            file_data: `data:application/pdf;base64,${buffer.toString('base64')}`
+          },
+          {
+            type: 'input_text',
+            text: 'Transcribe all readable content from the PDF into ordered blocks.'
+          }
+        ]
+      }],
+      options: {
+        store: false,
+        max_output_tokens: 16000,
+        prompt_cache_key: 'pdf-reading-v1',
+        instructions: pdfReadingInstructions,
+        text: {
+          format: {
+            type: 'json_schema',
+            name: 'pdf_reading',
+            strict: true,
+            schema: pdfReadingSchema
+          }
+        }
+      }
+    })
+
+    const { blocks } = JSON.parse(response.output_text)
+    let previousPage = 1
+
+    for (const block of blocks) {
+      if (
+        !Number.isInteger(block.page) ||
+        block.page < previousPage ||
+        block.page > pageCount ||
+        !block.text.trim()
+      ) {
+        throw new Error(`Bloque PDF inválido en ${filePath}`)
+      }
+
+      previousPage = block.page
+    }
+
+    return blocks.map(block => ({
+      page: pageOffset + block.page,
+      source_type: block.type,
+      source_level: null,
+      text: block.text
+    }))
   }
 }
 
