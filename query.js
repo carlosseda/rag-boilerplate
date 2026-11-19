@@ -2,8 +2,8 @@
   const fs = require('fs/promises')
   const VectorService = require('./services/vector-service')
   const OpenAIService = require('./services/openai-service')
-  const { keywordsQuerySchema, answerGenerationSchema } = require('./ia/schemas')
-  const { keywordsQueryInstructions, answerGenerationInstructions} = require('./ia/instructions')
+  const { answerGenerationSchema } = require('./ia/schemas')
+  const { answerGenerationInstructions} = require('./ia/instructions')
 
   let userQuery = "¿Quienes son los responsable de encauzar las conversaciones con las entidades de discapacitados?"
 

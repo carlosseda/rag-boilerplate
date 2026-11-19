@@ -3,8 +3,8 @@
   const path = require('path')
   const VectorService = require('./services/vector-service')
   const OpenAIService = require('./services/openai-service')
-  const { keywordsQuerySchema, answerGenerationSchema } = require('./ia/schemas')
-  const { keywordsQueryInstructions, answerGenerationWithPdfsInstructions} = require('./ia/instructions')
+  const { answerGenerationSchema } = require('./ia/schemas')
+  const { answerGenerationWithPdfsInstructions} = require('./ia/instructions')
 
   const userQuery = "Según la Orden 43/2026, ¿qué diferencias existen entre las funciones del Jefe del Departamento Económico y las del Jefe del Servicio de Gestión Económica de la Consejería de Familias, Bienestar Social y Atención a la Dependencia? Indica los códigos identificativos de ambos puestos, sus respectivas responsabilidades en la elaboración y ejecución presupuestaria, quién gestiona los expedientes económicos y qué puesto asume las funciones del Jefe del Departamento Económico en caso de ausencia."
 
