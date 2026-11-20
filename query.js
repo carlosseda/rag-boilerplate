@@ -1,5 +1,4 @@
 (async () => {
-  const fs = require('fs/promises')
   const VectorService = require('./services/vector-service')
   const OpenAIService = require('./services/openai-service')
   const { answerGenerationSchema } = require('./ia/schemas')
